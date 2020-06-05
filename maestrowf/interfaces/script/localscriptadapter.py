@@ -30,12 +30,14 @@
 """Local interface implementation."""
 import logging
 import os
+import psutil
 
 from maestrowf.abstracts.enums import JobStatusCode, SubmissionCode, \
     CancelCode
 from maestrowf.interfaces.script import CancellationRecord, SubmissionRecord
 from maestrowf.abstracts.interfaces import ScriptAdapter
 from maestrowf.utils import start_process
+from pyaestro.utilities.executor import Executor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -93,6 +95,85 @@ class LocalScriptAdapter(ScriptAdapter):
             restart_path = None
 
         return to_be_scheduled, script_path, restart_path
+
+    def check_jobs(self, joblist):
+        """
+        For the given job list, query execution status.
+
+        :param joblist: A list of job identifiers to be queried.
+        :returns: The return code of the status query, and a dictionary of job
+            identifiers to their status.
+        """
+        return JobStatusCode.NOJOBS, {}
+
+    def cancel_jobs(self, joblist):
+        """
+        For the given job list, cancel each job.
+
+        :param joblist: A list of job identifiers to be cancelled.
+        :returns: The return code to indicate if jobs were cancelled.
+        """
+        return CancellationRecord(CancelCode.OK, 0)
+
+    def submit(self, step, path, cwd, job_map=None, env=None):
+        """
+        Execute the step locally.
+
+        If cwd is specified, the submit method will operate outside of the path
+        specified by the 'cwd' parameter.
+        If env is specified, the submit method will set the environment
+        variables for submission to the specified values. The 'env' parameter
+        should be a dictionary of environment variables.
+
+        :param step: An instance of a StudyStep.
+        :param path: Path to the script to be executed.
+        :param cwd: Path to the current working directory.
+        :param job_map: A map of workflow step names to their job identifiers.
+        :param env: A dict containing a modified environment for execution.
+        :returns: The return code of the submission command and job identiifer.
+        """
+        LOGGER.debug("cwd = %s", cwd)
+        LOGGER.debug("Script to execute: %s", path)
+        p = start_process(path, shell=False, cwd=cwd, env=env)
+        pid = p.pid
+        output, err = p.communicate()
+        retcode = p.wait()
+
+        o_path = os.path.join(cwd, "{}.{}.out".format(step.name, pid))
+        e_path = os.path.join(cwd, "{}.{}.err".format(step.name, pid))
+
+        with open(o_path, "w") as out:
+            out.write(output)
+
+        with open(e_path, "w") as out:
+            out.write(err)
+
+        if retcode == 0:
+            LOGGER.info("Execution returned status OK.")
+            return SubmissionRecord(SubmissionCode.OK, retcode, pid)
+        else:
+            LOGGER.warning("Execution returned an error: %s", str(err))
+            _record = SubmissionRecord(SubmissionCode.ERROR, retcode, pid)
+            _record.add_info("stderr", str(err))
+            return _record
+
+
+class LocalParallelAdapter(LocalScriptAdapter):
+    """An adapter for scheduler-like and parallel local execution."""
+
+    key = "local_parallel"
+
+    def __init__(self, **kwargs):
+        """
+        Initialize an instance of the SlurmScriptAdapter.
+
+        - max_local: The maximum number of parallel local processes.
+
+        :param **kwargs: A dictionary with default settings for the adapter.
+        """
+        super(LocalParallelAdapter, self).__init__(**kwargs)
+        self._executor = Executor(
+            kwargs.pop("max_local", int(psutil.cpu_count() / 2)))
 
     def check_jobs(self, joblist):
         """
