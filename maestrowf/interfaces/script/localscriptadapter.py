@@ -28,16 +28,17 @@
 ###############################################################################
 
 """Local interface implementation."""
+from collections import defaultdict
 import logging
 import os
 import psutil
 
 from maestrowf.abstracts.enums import JobStatusCode, SubmissionCode, \
-    CancelCode
+    CancelCode, State
 from maestrowf.interfaces.script import CancellationRecord, SubmissionRecord
 from maestrowf.abstracts.interfaces import ScriptAdapter
 from maestrowf.utils import start_process
-from pyaestro.utilities.executor import Executor
+from pyaestro.utilities.executor import Executor, ExecTaskState
 
 LOGGER = logging.getLogger(__name__)
 
@@ -163,11 +164,23 @@ class LocalParallelAdapter(LocalScriptAdapter):
 
     key = "local_parallel"
 
+    EXEC2ADAP_STATES = {
+        ExecTaskState.SUCCESS:     State.FINISHED,
+        ExecTaskState.INITIALIZED: State.INITIALIZED,
+        ExecTaskState.PENDING:     State.PENDING,
+        ExecTaskState.RUNNING:     State.RUNNING,
+        ExecTaskState.CANCELLED:   State.CANCELLED,
+        ExecTaskState.FAILED:      State.FAILED,
+        ExecTaskState.UNKNOWN:     State.UNKNOWN,
+    }
+
     def __init__(self, **kwargs):
         """
-        Initialize an instance of the SlurmScriptAdapter.
+        Initialize an instance of the LocalParallelAdapter.
 
-        - max_local: The maximum number of parallel local processes.
+        The expected keyword arguments that are expected when the adapter
+        is instantiated are as follows:
+        - max_local: The max number of local process allowed to run at once.
 
         :param **kwargs: A dictionary with default settings for the adapter.
         """
@@ -183,7 +196,24 @@ class LocalParallelAdapter(LocalScriptAdapter):
         :returns: The return code of the status query, and a dictionary of job
             identifiers to their status.
         """
-        return JobStatusCode.NOJOBS, {}
+        # We assume that the status check will go just fine since we're local.
+        ret_code = JobStatusCode.OK
+        status = defaultdict(State.UNKNOWN)
+        try:
+            # Try to check the status of all running jobs.
+            gen_statuses = self._executor.get_all_status()
+            for jobid, state in gen_statuses:
+                if jobid in joblist:
+                    status[jobid] = self.EXEC2ADAP_STATES[state]
+            # If we got an empty dictionary, no jobs found.
+            if not status:
+                ret_code = JobStatusCode.NOJOBS
+
+        except Exception:
+            status = {}
+            ret_code = JobStatusCode.ERROR
+
+        return ret_code, status
 
     def cancel_jobs(self, joblist):
         """
@@ -213,25 +243,11 @@ class LocalParallelAdapter(LocalScriptAdapter):
         """
         LOGGER.debug("cwd = %s", cwd)
         LOGGER.debug("Script to execute: %s", path)
-        p = start_process(path, shell=False, cwd=cwd, env=env)
-        pid = p.pid
-        output, err = p.communicate()
-        retcode = p.wait()
-
-        o_path = os.path.join(cwd, "{}.{}.out".format(step.name, pid))
-        e_path = os.path.join(cwd, "{}.{}.err".format(step.name, pid))
-
-        with open(o_path, "w") as out:
-            out.write(output)
-
-        with open(e_path, "w") as out:
-            out.write(err)
-
-        if retcode == 0:
-            LOGGER.info("Execution returned status OK.")
-            return SubmissionRecord(SubmissionCode.OK, retcode, pid)
-        else:
+        try:
+            jid = self._executor.submit(path, cwd, env=env)
+            return SubmissionRecord(SubmissionCode.OK, 0, jid)
+        except Exception as err:
             LOGGER.warning("Execution returned an error: %s", str(err))
-            _record = SubmissionRecord(SubmissionCode.ERROR, retcode, pid)
+            _record = SubmissionRecord(SubmissionCode.ERROR, -1)
             _record.add_info("stderr", str(err))
             return _record
